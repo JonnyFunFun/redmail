@@ -1,0 +1,545 @@
+#!/usr/bin/env python
+# coding=utf-8
+__author__ = "Jonathan Enzinna <jonnyfunfun@gmail.com>"
+__version__ = '0.0.1'
+
+import os
+import sys
+import curses
+import urllib2
+import urlparse
+import math
+import thread
+import time
+
+from datetime import datetime
+from ConfigParser import ConfigParser
+from optparse import OptionParser
+from threading import Timer
+from urllib import quote
+
+try:
+    import json
+except ImportError:
+    import simplejson as json
+
+# some "constant" strings
+USAGE = """%s [-v|--version] [-c|--config]
+
+Redmail is a command-line Reddit mail client
+http://github.com/JonnyFunFun/redmail""" % sys.argv[0]
+VERSION = """redmail v%(version)s <http://github.com/JonnyFunFun/redmail>
+
+Copyright (c) %(year)s : %(author)s
+Released under the MIT license.
+""" % dict(
+    version=__version__,
+    year=datetime.now().year,
+    author=__author__
+)
+
+DEFAULT_CONFIG_FILE = os.path.expanduser("~/.redmail/config")
+
+COLOR_NAMES = {
+    "black": 0,
+    "red": 1,
+    "green": 2,
+    "yellow": 3,
+    "blue": 4,
+    "magenta": 5,
+    "cyan": 6,
+    "white": 7,
+    "default": -1,
+}
+
+# messages
+MESSAGES = {
+    "new-config": "A default configuration file has been written, please edit it and add your\nReddit JSON url.  See redmail(1) for more information.",
+    "bad-config": "Your configuration file is invalid.  Please check it and try again or specify\na different configuration path.",
+    "config-error": "A configuration error has occurred:\n%s"
+}
+
+# UI line formats
+UI_LINES = {
+    "title": " Redmail/{user} -- {threads} threads, {total} messages, {unread} unread -- /{loc}",
+    "toolbar": "(q)uit    (r)efresh    (o)pen    (z)mark read    mark a(l)l read    (h)ome",
+    "message-thread-line": " >> {subject}"
+}
+
+# Default configuration options
+Config = {
+    "update-timer": 5,
+    "browser": "",
+    "reddit-url": "",
+    "use-color": True
+}
+
+Colors = {
+    "title": ("brightred", "blue"),
+    "toolbar": ("yellow", "blue"),
+    "normal": ("white", "black"),
+    "entry": ("white", "black"),
+    "entry-data": ("yellow", "black"),
+    "entry-selected": ("brightyellow", "magenta"),
+    "entry-unread": ("red", "black"),
+    "entry-data-selected": ("brightyellow", "magenta"),
+    "entry-bottom": ("green", "black"),
+    "entry-bottom-selected": ("brightyellow", "magenta"),
+    "entry-bottom-data": ("yellow", "black"),
+    "entry-bottom-data-selected": ("brightyellow", "magenta"),
+    "messages": ("brightgreen", "blue"),
+}
+
+# key bindings
+Bindings = {
+    ord("q"): "quit",
+    ord("r"): "update",
+
+    ord("k"): "prev-line",
+    ord("j"): "next-line",
+
+    ord("o"): "open",
+    10: "open", #enter
+    ord("z"): "mark-read",
+
+    ord("l"): "mark-all-read",
+
+    ord("h"): "home",
+
+    ord(""): "prev-page",
+    ord(""): "next-page",
+
+    ord(""): "redraw",
+
+    curses.KEY_HOME: "first-line",
+    curses.KEY_END: "last-line",
+
+    curses.KEY_UP: "prev-line",
+    curses.KEY_DOWN: "next-line",
+
+    curses.KEY_PPAGE: "prev-page",
+    curses.KEY_NPAGE: "next-page",
+}
+
+# exceptions
+class ImproperlyConfigured(Exception):
+    def __init__(self, value):
+        self.value = value
+    def __str__(self):
+        return repr(self.value)
+
+# config parser
+def parse_config(file):
+    config = ConfigParser()
+
+    if not os.path.exists(file):
+        if file is not DEFAULT_CONFIG_FILE:
+            return parse_config(DEFAULT_CONFIG_FILE)
+        else:
+            # write the default configuration file
+            try:
+                os.stat(os.path.dirname(DEFAULT_CONFIG_FILE))
+            except:
+                os.mkdir(os.path.dirname(DEFAULT_CONFIG_FILE))
+            config_file = open(DEFAULT_CONFIG_FILE, 'w')
+            config.add_section("redmail")
+            for k,v in Config.items():
+                config.set("redmail",k,v)
+            config.write(config_file)
+            config_file.close()
+
+            raise ImproperlyConfigured(MESSAGES['new-config'])
+
+    config.read([file,])
+
+    if config.has_section("redmail"):
+        for opt in config.options("redmail"):
+            Config[opt] = unicode(config.get("redmail", opt))
+    else:
+        raise ImproperlyConfigured(MESSAGES['bad-config'])
+
+    if config.has_section("color"):
+        for cname in config.options("color"):
+            col = config.get("color", cname).split(",")
+            if len(col) == 2:
+                Colors[cname] = col
+            else:
+                Colors[cname] = col[0], Colors["normal"][1]
+
+# some command functions
+commands = {}
+
+def command(name=None, cmds=None):
+    def cmd(func):
+        if cmds == None:
+            global commands
+            cm = commands
+        else:
+            cm = cmds
+        cm[(name or func.__name__)] = func
+        return func
+    return cmd
+
+def getcommand(name, cmds=None):
+    """Get a command by name."""
+    # Get command dict
+    if cmds == None:
+        global commands
+        cmd = commands
+    else:
+        cmd = cmds
+
+    # Exact match
+    if name in cmd:
+        return cmd[name]
+
+    # Prefix match
+    candidate = filter(lambda x: x.startswith(name), cmd.keys())
+
+    if len(candidate) == 1:
+        return cmd[candidate[0]]
+    elif candidate:
+        return candidate
+    else:
+        return None
+
+# message class
+class Message(object):
+    def __init__(self, item):
+        self.id = item['name']
+        self.parent = item['parent_id']
+        self.body = item['body']
+        self.user = item['author']
+        self.timestamp = item['created']
+        self.unread = item['new']
+
+# message thread class
+class MessageThread(object):
+    def __init__(self, item):
+        self.messages = []
+        self.subject = item['subject']
+        self.first_message_id = item['name']
+
+        self.messages.append(Message(item))
+
+    @property
+    def unread(self):
+        for message in self.messages:
+            if message.unread:
+                return True
+        return False
+
+# class to manage data
+class DataFactory(object):
+    def __init__(self, ui):
+        self.interface = ui
+        self.username = str(urlparse.parse_qs(urlparse.urlparse(Config['reddit-url']).query)['user'][0])
+        self.counts = dict(unread=0,total=0,threads=0)
+        self.error = False
+        self.loading = False
+        self._url = Config['reddit-url']
+
+        self.threads = {}
+        self.messages = {}
+
+    def update(self):
+        self.loading = True
+        self.interface.signal_for_update()
+        try:
+            req = urllib2.urlopen(self._url)
+            data = json.load(req)['data']['children']
+            self.error = None
+        except:
+            self.loading = False
+            self.error = "Error opening Reddit JSON feed"
+            self.interface.signal_for_update()
+            return
+
+        for item in data:
+            # process the message
+            if item['kind'] == 't4':
+                item = item['data']
+                item_id = item['name']
+                if not self.messages.has_key(item_id):
+                    # new message to us, bring in the data
+                    self.messages[item_id] = Message(item)
+                # new thread
+                if item['parent_id'] is None:
+                    if not self.threads.has_key(item_id):
+                        self.threads[item_id] = MessageThread(item)
+        self._collapse_threads()
+
+        self.counts['total'] = self.messages.keys().__len__()
+        self.counts['threads'] = self.threads.keys().__len__()
+        self.counts['unread'] = 0
+        for key in self.threads:
+            if self.threads[key].unread:
+                self.counts['unread'] += 1
+
+        self.loading = False
+        self.error = None
+        self.interface.signal_for_update()
+
+    def _collapse_threads(self):
+        # collapse our messages into threads
+        pass
+
+# UI class - manages the curses interface
+class UI(object):
+    def __init__(self):
+        self.screen = None
+        self.data = None
+        self.update_timer = Timer(int(Config['update-timer'])*60, self._update)
+
+        self._needs_update = False
+        self._quit = False
+
+        self._location = "Inbox"
+
+    def initialize(self):
+        # starts up curses and our UI
+        self.screen = curses.initscr()
+        self.screen.keypad(1)
+        self.screen.timeout(400)
+        self.screen.scrollok(0)
+        self.colors = None
+        self.page = 1
+        self.selected_index = -1
+        curses.noecho()
+        if Config['use-color']:
+            curses.start_color()
+            curses.use_default_colors()
+
+            # Initialise colors
+            self.colors = {}
+            pairnum = 1
+            for cname in Colors:
+                fg, bg = Colors[cname]
+
+                if fg.startswith("bright"):
+                    fbright = True
+                    fg = fg[6:]
+                else:
+                    fbright = False
+
+                try:
+                    curses.init_pair(pairnum, COLOR_NAMES[fg], COLOR_NAMES[bg])
+                except IndexError:
+                    curses.init_pair(pairnum, 0, 0)
+
+                self.colors[cname] = curses.color_pair(pairnum)
+
+                if fbright:
+                    self.colors[cname] |= curses.A_BOLD
+
+                pairnum += 1
+        # start up our data object
+        self.data = DataFactory(self)
+
+    def open_thread(self, thread):
+        pass
+
+    def move_home(self):
+        self._location = "Inbox"
+        self._needs_update = True
+
+    def start(self):
+        self.update_timer.start()
+        # selfish main loop!
+        self._update()
+        while not self._quit:
+            key = self.screen.getch()
+            if key in Bindings:
+                cmd = getcommand(Bindings[key])
+                if callable(cmd):
+                    cmd(self.data, self)
+            if self._needs_update:
+                self.refresh()
+                self._needs_update = False
+
+    def signal_for_update(self):
+        self._needs_update = True
+
+    def _update(self):
+        self.data.update()
+
+    def setline(self, y, x, line, color=None, offset=0, char=' '):
+        height, width = self.screen.getmaxyx()
+        line = line.ljust(width-offset, char)
+
+        if Config['use-color'] and color and color in self.colors:
+            self.screen.addstr(y, x, line, self.colors[color])
+        else:
+            self.screen.addstr(y, x, line)
+
+    def refresh(self):
+        h, w = self.screen.getmaxyx()
+
+        # Title
+        self.setline(0, 0, UI_LINES['title'].format(user=unicode(self.data.username),
+                                                    threads=self.data.counts['threads'],
+                                                    total=self.data.counts['total'],
+                                                    unread=self.data.counts['unread'],
+                                                    loc=self._location), color="title")
+
+        if self._location == "Inbox":
+            # draw the inbox
+            self._draw_inbox()
+        else:
+            # draw a message
+            self._draw_message()
+
+        if self.data.error:
+            pass
+            #self.screen.addstr(h-1, 0, self.data.error.center(w-1))
+        else:
+            self.setline(h-2, 0, "Loading...".center(w-1) if self.data.loading else UI_LINES['toolbar'].center(w-1), color="toolbar")
+
+        self.screen.refresh()
+
+    def _paginate(self, items, page):
+        h, w = self.screen.getmaxyx()
+        ipp = h - 2
+        if items.__len__() < ipp:
+            return items
+        else:
+            return items[(page-1)*ipp:ipp]
+
+    def _draw_inbox(self):
+        h, w = self.screen.getmaxyx()
+        y = 1
+        total_entries = self.data.threads.keys().__len__()
+
+        entries = self.data.threads.keys()
+        entries = self._paginate(entries, self.page)
+
+        for k in entries:
+            entry = self.data.threads[k]
+            if y < h-2:
+                # display it
+                color = "entry"
+                if self.selected_index == y:
+                    color = "entry-selected"
+                elif entry.unread:
+                    color = "entry-unread"
+                self.setline(y, 0, UI_LINES['message-thread-line'].format(subject=entry.subject), color=color)
+            y += 1
+
+    def _draw_message(self):
+        pass
+
+    def _draw_reply_window(self):
+        pass
+
+    def next_line(self):
+        h, w = self.screen.getmaxyx()
+        self.selected_index += 1
+        if self.selected_index == 0:
+            self.selected_index = 1
+        elif self.selected_index >= h:
+            if self.data.threads.keys().__len__() > self.page*h:
+                # next page
+                self.page += 1
+                self.selected_index = 1
+            else:
+                self.selected_index -= 1
+        self._needs_update = True
+
+    def prev_line(self):
+        h, w = self.screen.getmaxyx()
+        self.selected_index -= 1
+        if self.selected_index == 0:
+            if self.page != 1:
+                self.page -= 1
+            else:
+                self.selected_index = 1
+        self._needs_update = True
+
+    def next_page(self):
+        self.selected_index = 1
+        self.page += 1
+        # clip
+        if self.page > self.total_pages:
+            self.page = self.total_pages
+        self._needs_update = True
+
+    def prev_page(self):
+        self.selected_index = 1
+        if self.page != 1:
+            self.page -= 1
+        self._needs_update = True
+
+    @property
+    def total_pages(self, location="Inbox"):
+        h, w = self.screen.getmaxyx()
+        ipp = h - 2
+        return math.ceil(self.data.threads.keys().__len__() / ipp)
+
+    def cleanup(self):
+        #stop our timer and close curses
+        self.update_timer.cancel()
+        curses.endwin()
+
+    def quit(self):
+        self._quit = True
+
+@command(name="quit")
+def cmd_quit(data, ui):
+    ui.quit()
+
+@command(name="update")
+def cmd_update(data, ui):
+    data.update()
+
+@command(name="home")
+def cmd_home(data, ui):
+    if not ui._location == "Inbox":
+        ui.move_home()
+
+@command(name="prev-line")
+def cmd_prev_line(data, ui):
+    ui.prev_line()
+
+@command(name="next-line")
+def cmd_next_line(data, ui):
+    ui.next_line()
+
+@command(name="next-page")
+def cmd_next_page(data, ui):
+    ui.next_page()
+
+@command(name="prev-page")
+def cmd_prev_page(data,ui):
+    ui.prev_page()
+
+
+def main():
+    # parse arguments
+    parser = OptionParser(USAGE)
+    parser.add_option("-v", "--version", action="store_true", dest="display_version", help="display version information")
+    parser.add_option("-c", "--config", dest="config_file", help="specify the config file to use, defaults to %s" % DEFAULT_CONFIG_FILE)
+    #parser.add_option("-h", "--help", action="store_true", dest="display_help")
+    (options, args) = parser.parse_args()
+    if options.display_version:
+        print(VERSION)
+        return
+    config_file = os.path.expanduser(options.config_file or DEFAULT_CONFIG_FILE)
+    try:
+        parse_config(config_file)
+    except ImproperlyConfigured as e:
+        print MESSAGES['config-error'] % e.value
+
+    ui = UI()
+
+    try:
+        ui.initialize()
+        ui.start()
+        ui.cleanup()
+    except:
+        ui.cleanup()
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == '__main__':
+    main()
