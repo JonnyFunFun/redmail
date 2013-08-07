@@ -22,6 +22,12 @@ try:
     import json
 except ImportError:
     import simplejson as json
+    
+try:
+    import praw
+except ImportError:
+    print "Redmail requires praw to work.  You can probably install it with `pip install praw`"
+    exit()
 
 # some "constant" strings
 USAGE = """%s [-v|--version] [-c|--config]
@@ -54,7 +60,6 @@ COLOR_NAMES = {
 
 # messages
 MESSAGES = {
-    "new-config": "A default configuration file has been written, please edit it and add your\nReddit JSON url.  See redmail(1) for more information.",
     "bad-config": "Your configuration file is invalid.  Please check it and try again or specify\na different configuration path.",
     "config-error": "A configuration error has occurred:\n%s"
 }
@@ -71,6 +76,7 @@ Config = {
     "update-timer": 5,
     "browser": "",
     "reddit-url": "",
+    "last-username": "",
     "use-color": True
 }
 
@@ -87,6 +93,10 @@ Colors = {
     "entry-bottom-selected": ("brightyellow", "magenta"),
     "entry-bottom-data": ("yellow", "black"),
     "entry-bottom-data-selected": ("brightyellow", "magenta"),
+    "textinput": ("white", "cyan"),
+    "textinput-selected": ("brightyellow", "magenta"),
+    "submit": ("white", "blue"),
+    "submit-selected": ("cyan", "magenta"),
     "messages": ("brightgreen", "blue"),
 }
 
@@ -148,8 +158,6 @@ def parse_config(file):
             config.write(config_file)
             config_file.close()
 
-            raise ImproperlyConfigured(MESSAGES['new-config'])
-
     config.read([file,])
 
     if config.has_section("redmail"):
@@ -165,6 +173,23 @@ def parse_config(file):
                 Colors[cname] = col
             else:
                 Colors[cname] = col[0], Colors["normal"][1]
+                
+# write config
+def save_config(file):
+    config = ConfigParser()
+
+    # write the default configuration file
+    try:
+        os.stat(os.path.dirname(file))
+    except:
+        os.mkdir(os.path.dirname(file))
+    config_file = open(file, 'w')
+    config.add_section("redmail")
+    for k,v in Config.items():
+        config.set("redmail",k,v)
+    config.write(config_file)
+    config_file.close()
+
 
 # some command functions
 commands = {}
@@ -231,9 +256,15 @@ class MessageThread(object):
 
 # class to manage data
 class DataFactory(object):
-    def __init__(self, ui):
+    def __init__(self, ui, config_file):
         self.interface = ui
-        self.username = str(urlparse.parse_qs(urlparse.urlparse(Config['reddit-url']).query)['user'][0])
+        self.config_file = config_file
+        
+        self.username, self.password = self.interface.do_login(Config['last-username'])
+
+        Config['last-username'] = self.username
+        save_config(config_file)
+
         self.counts = dict(unread=0,total=0,threads=0)
         self.error = False
         self.loading = False
@@ -296,7 +327,7 @@ class UI(object):
 
         self._location = "Inbox"
 
-    def initialize(self):
+    def initialize(self, config_file):
         # starts up curses and our UI
         self.screen = curses.initscr()
         self.screen.keypad(1)
@@ -333,8 +364,64 @@ class UI(object):
                     self.colors[cname] |= curses.A_BOLD
 
                 pairnum += 1
+        
         # start up our data object
-        self.data = DataFactory(self)
+        self.data = DataFactory(self, config_file)
+
+    def do_login(self, last_username = ''):
+        height, width = self.screen.getmaxyx()
+        pos_x = (width - 40) / 2
+        pos_y = (height - 11) / 2
+        selected = "u"
+        password = ""
+        username = last_username
+        if username.__len__() is not 0:
+            selected = "p"
+        login_win = curses.newwin(11, 40, pos_y, pos_x)
+        login_win.addstr(1, 1, "Login to Reddit".center(40), self.colors['title'])
+        login_win.addstr(3, 1, "Username:")
+        login_win.addstr(4, 5, username.ljust(30), self.colors['textinput-selected' if selected is "u" else 'textinput'])
+        login_win.addstr(6, 1, "Password:")
+        login_win.addstr(7, 5, "".ljust(30), self.colors['textinput-selected' if selected is "p" else 'textinput'])
+        login_win.addstr(9, 15, "Login".center(10), self.colors['submit'])
+        login_win.move(4, 5)
+        login_win.border()
+        login_win.refresh()
+        while True:
+            chcode = login_win.getch()
+            char = chr(chcode)
+            if chcode == 10: # enter
+                if selected is "u":
+                    selected = "p"
+                elif selected is "p":
+                    selected = "s"
+                else:
+                    return username, password
+            elif chcode == 27: # special escape            
+                chcode = login_win.getch() # gets rid of 91
+                chcode = login_win.getch()
+                if chcode  == 66: # down
+                    if selected is "u":
+                        selected = "p"
+                    elif selected is "p":
+                        selected = "s"
+                elif chcode == 65: #up
+                    if selected is "s":
+                        selected = "p"
+                    elif selected is "p":
+                        selected = "u"
+            elif chcode == 127: # backspace
+                if selected is "p":
+                    password = password[:-1]
+                else:
+                    username = username[:-1]
+            elif selected is "u":
+                username += chr(chcode)
+            elif selected is "p":
+                password += chr(chcode)
+            login_win.addstr(4, 5, username.ljust(30), self.colors['textinput-selected' if selected is "u" else 'textinput'])
+            login_win.addstr(7, 5, ("*" * password.__len__()).ljust(30), self.colors['textinput-selected' if selected is "p" else 'textinput'])
+            login_win.addstr(9, 15, "Login".center(10), self.colors['submit-selected' if selected is "s" else 'submit'])            
 
     def open_thread(self, thread):
         pass
@@ -532,7 +619,7 @@ def main():
     ui = UI()
 
     try:
-        ui.initialize()
+        ui.initialize(config_file)
         ui.start()
         ui.cleanup()
     except:
