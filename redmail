@@ -11,6 +11,7 @@ import urlparse
 import math
 import thread
 import time
+import platform
 
 from datetime import datetime
 from ConfigParser import ConfigParser
@@ -44,6 +45,8 @@ Released under the MIT license.
     author=__author__
 )
 
+USER_AGENT = """Redmail/%(version)s %(platform)s""" % dict( version=__version__, platform=platform.platform() )
+
 DEFAULT_CONFIG_FILE = os.path.expanduser("~/.redmail/config")
 
 COLOR_NAMES = {
@@ -66,8 +69,9 @@ MESSAGES = {
 
 # UI line formats
 UI_LINES = {
-    "title": " Redmail/{user} -- {threads} threads, {total} messages, {unread} unread -- /{loc}",
+    "title": " Redmail/{user} -- {total} messages, {unread} unread -- /{loc}",
     "toolbar": "(q)uit    (r)efresh    (o)pen    (z)mark read    mark a(l)l read    (h)ome",
+    "item-toolbar": "(q)uit    mark (u)nread/r(e)ad    rep(l)y    (h)ome",
     "message-thread-line": " >> {subject}"
 }
 
@@ -77,6 +81,7 @@ Config = {
     "browser": "",
     "reddit-url": "",
     "last-username": "",
+    "time-format": "'%Y-%m-%d %H:%M:%S'",
     "use-color": True
 }
 
@@ -131,6 +136,7 @@ Bindings = {
     curses.KEY_NPAGE: "next-page",
 }
 
+
 # exceptions
 class ImproperlyConfigured(Exception):
     def __init__(self, value):
@@ -138,12 +144,13 @@ class ImproperlyConfigured(Exception):
     def __str__(self):
         return repr(self.value)
 
+
 # config parser
-def parse_config(file):
+def parse_config(filename):
     config = ConfigParser()
 
-    if not os.path.exists(file):
-        if file is not DEFAULT_CONFIG_FILE:
+    if not os.path.exists(filename):
+        if filename is not DEFAULT_CONFIG_FILE:
             return parse_config(DEFAULT_CONFIG_FILE)
         else:
             # write the default configuration file
@@ -158,7 +165,7 @@ def parse_config(file):
             config.write(config_file)
             config_file.close()
 
-    config.read([file,])
+    config.read([filename,])
 
     if config.has_section("redmail"):
         for opt in config.options("redmail"):
@@ -173,17 +180,18 @@ def parse_config(file):
                 Colors[cname] = col
             else:
                 Colors[cname] = col[0], Colors["normal"][1]
-                
+
+
 # write config
-def save_config(file):
+def save_config(filename):
     config = ConfigParser()
 
     # write the default configuration file
     try:
-        os.stat(os.path.dirname(file))
+        os.stat(os.path.dirname(filename))
     except:
-        os.mkdir(os.path.dirname(file))
-    config_file = open(file, 'w')
+        os.mkdir(os.path.dirname(filename))
+    config_file = open(filename, 'w')
     config.add_section("redmail")
     for k,v in Config.items():
         config.set("redmail",k,v)
@@ -193,6 +201,7 @@ def save_config(file):
 
 # some command functions
 commands = {}
+
 
 def command(name=None, cmds=None):
     def cmd(func):
@@ -204,6 +213,7 @@ def command(name=None, cmds=None):
         cm[(name or func.__name__)] = func
         return func
     return cmd
+
 
 def getcommand(name, cmds=None):
     """Get a command by name."""
@@ -228,31 +238,6 @@ def getcommand(name, cmds=None):
     else:
         return None
 
-# message class
-class Message(object):
-    def __init__(self, item):
-        self.id = item['name']
-        self.parent = item['parent_id']
-        self.body = item['body']
-        self.user = item['author']
-        self.timestamp = item['created']
-        self.unread = item['new']
-
-# message thread class
-class MessageThread(object):
-    def __init__(self, item):
-        self.messages = []
-        self.subject = item['subject']
-        self.first_message_id = item['name']
-
-        self.messages.append(Message(item))
-
-    @property
-    def unread(self):
-        for message in self.messages:
-            if message.unread:
-                return True
-        return False
 
 # class to manage data
 class DataFactory(object):
@@ -265,55 +250,37 @@ class DataFactory(object):
         Config['last-username'] = self.username
         save_config(config_file)
 
-        self.counts = dict(unread=0,total=0,threads=0)
+        self.praw = praw.Reddit(user_agent=USER_AGENT)
+        self.praw.login(self.username, self.password)
+
+        self.counts = dict(unread=0, total=0)
         self.error = False
         self.loading = False
-        self._url = Config['reddit-url']
 
         self.threads = {}
-        self.messages = {}
+        self.messages = []
+
+        self.update()
 
     def update(self):
         self.loading = True
         self.interface.signal_for_update()
-        try:
-            req = urllib2.urlopen(self._url)
-            data = json.load(req)['data']['children']
-            self.error = None
-        except:
-            self.loading = False
-            self.error = "Error opening Reddit JSON feed"
-            self.interface.signal_for_update()
-            return
 
-        for item in data:
-            # process the message
-            if item['kind'] == 't4':
-                item = item['data']
-                item_id = item['name']
-                if not self.messages.has_key(item_id):
-                    # new message to us, bring in the data
-                    self.messages[item_id] = Message(item)
-                # new thread
-                if item['parent_id'] is None:
-                    if not self.threads.has_key(item_id):
-                        self.threads[item_id] = MessageThread(item)
-        self._collapse_threads()
-
-        self.counts['total'] = self.messages.keys().__len__()
-        self.counts['threads'] = self.threads.keys().__len__()
+        self.messages = []
         self.counts['unread'] = 0
-        for key in self.threads:
-            if self.threads[key].unread:
-                self.counts['unread'] += 1
+
+        for item in self.praw.get_inbox(limit=None):
+            if type(item) is praw.objects.Message:
+                self.messages.append(item)
+                if item.new:
+                    self.counts['unread'] += 1
+
+        self.counts['total'] = self.messages.__len__()
 
         self.loading = False
         self.error = None
         self.interface.signal_for_update()
 
-    def _collapse_threads(self):
-        # collapse our messages into threads
-        pass
 
 # UI class - manages the curses interface
 class UI(object):
@@ -396,6 +363,7 @@ class UI(object):
                 elif selected is "p":
                     selected = "s"
                 else:
+                    self.show_loading_modal()
                     return username, password
             elif chcode == 27: # special escape            
                 chcode = login_win.getch() # gets rid of 91
@@ -422,6 +390,16 @@ class UI(object):
             login_win.addstr(4, 5, username.ljust(30), self.colors['textinput-selected' if selected is "u" else 'textinput'])
             login_win.addstr(7, 5, ("*" * password.__len__()).ljust(30), self.colors['textinput-selected' if selected is "p" else 'textinput'])
             login_win.addstr(9, 15, "Login".center(10), self.colors['submit-selected' if selected is "s" else 'submit'])            
+
+    def show_loading_modal(self):
+        height, width = self.screen.getmaxyx()
+        pos_x = (width - 20) / 2
+        pos_y = (height - 3) / 2
+        modal_win = curses.newwin(3, 20, pos_y, pos_x)
+        modal_win.addstr(1 ,1, "Loading...".center(18))
+        modal_win.move(0, 0)
+        modal_win.border()
+        modal_win.refresh()
 
     def open_thread(self, thread):
         pass
@@ -462,25 +440,27 @@ class UI(object):
     def refresh(self):
         h, w = self.screen.getmaxyx()
 
+        for row in range(1, h-1):
+            self.setline(row, 0, (" "*w))
+
         # Title
         self.setline(0, 0, UI_LINES['title'].format(user=unicode(self.data.username),
-                                                    threads=self.data.counts['threads'],
                                                     total=self.data.counts['total'],
                                                     unread=self.data.counts['unread'],
                                                     loc=self._location), color="title")
 
-        if self._location == "Inbox":
+        if self._location == "Inbox" or self.current_item is None:
             # draw the inbox
             self._draw_inbox()
         else:
             # draw a message
-            self._draw_message()
+            self._draw_message(self.current_item)
 
         if self.data.error:
-            pass
-            #self.screen.addstr(h-1, 0, self.data.error.center(w-1))
-        else:
-            self.setline(h-2, 0, "Loading...".center(w-1) if self.data.loading else UI_LINES['toolbar'].center(w-1), color="toolbar")
+            self.screen.addstr(h-1, 0, self.data.error.center(w-1))
+
+        if self.data.loading:
+            self.setline(h-2, 0, "Loading...".center(w-1))
 
         self.screen.refresh()
 
@@ -495,25 +475,33 @@ class UI(object):
     def _draw_inbox(self):
         h, w = self.screen.getmaxyx()
         y = 1
-        total_entries = self.data.threads.keys().__len__()
 
-        entries = self.data.threads.keys()
-        entries = self._paginate(entries, self.page)
+        entries = self._paginate(self.data.messages, self.page)
 
-        for k in entries:
-            entry = self.data.threads[k]
+        for entry in entries:
             if y < h-2:
                 # display it
                 color = "entry"
                 if self.selected_index == y:
                     color = "entry-selected"
-                elif entry.unread:
+                elif entry.new:
                     color = "entry-unread"
                 self.setline(y, 0, UI_LINES['message-thread-line'].format(subject=entry.subject), color=color)
             y += 1
 
-    def _draw_message(self):
-        pass
+        self.setline(h-2, 0, UI_LINES['toolbar'].center(w-1), color="toolbar")
+
+    def _draw_message(self, message):
+        h, w = self.screen.getmaxyx()
+        y = 0
+        if message.author is not None:
+            self.setline(1, 0, "From: " + message.author.name)
+            y+=1
+        self.setline(y+1, 0, "Date: " + datetime.fromtimestamp(message.created).strftime(Config['time-format']))
+        self.setline(y+2, 0, ">> " + message.subject)
+        self.setline(y+4, 0, message.body)
+
+        self.setline(h-2, 0, UI_LINES['item-toolbar'].center(w-1), color="toolbar")
 
     def _draw_reply_window(self):
         pass
@@ -556,6 +544,17 @@ class UI(object):
             self.page -= 1
         self._needs_update = True
 
+    def open_item(self):
+        idx = (self.selected_index + ((self.page - 1) * self.items_per_page)) - 1
+        item = self.data.messages[idx]
+        self._location = item.subject
+        self.current_item = item
+        self._needs_update = True
+
+    @property
+    def items_per_page(self):
+        return self.screen.getmaxyx()[0] - 2
+
     @property
     def total_pages(self, location="Inbox"):
         h, w = self.screen.getmaxyx()
@@ -570,34 +569,46 @@ class UI(object):
     def quit(self):
         self._quit = True
 
+
 @command(name="quit")
 def cmd_quit(data, ui):
     ui.quit()
 
+
 @command(name="update")
 def cmd_update(data, ui):
     data.update()
+
 
 @command(name="home")
 def cmd_home(data, ui):
     if not ui._location == "Inbox":
         ui.move_home()
 
+
 @command(name="prev-line")
 def cmd_prev_line(data, ui):
     ui.prev_line()
+
 
 @command(name="next-line")
 def cmd_next_line(data, ui):
     ui.next_line()
 
+
 @command(name="next-page")
 def cmd_next_page(data, ui):
     ui.next_page()
 
+
 @command(name="prev-page")
-def cmd_prev_page(data,ui):
+def cmd_prev_page(data, ui):
     ui.prev_page()
+
+
+@command(name="open")
+def cmd_open_item(data, ui):
+    ui.open_item()
 
 
 def main():
